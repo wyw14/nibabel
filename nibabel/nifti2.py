@@ -254,13 +254,16 @@ class Nifti2Image(Nifti1Image):
     _meta_sniff_len = header_class.sizeof_hdr
 
 
-def load(filename):
+def load(filename, **kwargs):
     """Load NIfTI2 single or pair image from `filename`
 
     Parameters
     ----------
     filename : str
         filename of image to be loaded
+    \*\*kwargs : keyword arguments
+        Keyword arguments to format-specific load, such as
+        ``lazy_extensions=True`` for deferred extension payload reads.
 
     Returns
     -------
@@ -275,9 +278,9 @@ def load(filename):
         if `filename` does not exist.
     """
     try:
-        img = Nifti2Image.load(filename)
+        img = Nifti2Image.load(filename, **kwargs)
     except ImageFileError:
-        return Nifti2Pair.load(filename)
+        return Nifti2Pair.load(filename, **kwargs)
     return img
 
 

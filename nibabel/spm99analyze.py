@@ -235,7 +235,7 @@ class Spm99AnalyzeImage(analyze.AnalyzeImage):
     rw = have_scipy
 
     @classmethod
-    def from_file_map(klass, file_map, *, mmap=True, keep_file_open=None):
+    def from_file_map(klass, file_map, *, mmap=True, keep_file_open=None, lazy_extensions=False):
         """Class method to create image from mapping in ``file_map``
 
         Parameters
@@ -260,13 +260,20 @@ class Spm99AnalyzeImage(analyze.AnalyzeImage):
             If ``file_map`` refers to an open file handle, this setting has no
             effect. The default value (``None``) will result in the value of
             ``nibabel.arrayproxy.KEEP_FILE_OPEN_DEFAULT`` being used.
+        lazy_extensions : bool, keyword only, optional
+            Not supported for SPM analyze images; raises ``ValueError`` if True.
 
         Returns
         -------
         img : Spm99AnalyzeImage instance
 
         """
-        ret = super().from_file_map(file_map, mmap=mmap, keep_file_open=keep_file_open)
+        ret = super().from_file_map(
+            file_map,
+            mmap=mmap,
+            keep_file_open=keep_file_open,
+            lazy_extensions=lazy_extensions,
+        )
         try:
             matf = file_map['mat'].get_prepare_fileobj()
         except OSError:

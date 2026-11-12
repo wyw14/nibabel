@@ -8,8 +8,10 @@
 ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ##
 """Tests for nifti reading package"""
 
+import copy
 import os
 import struct
+import threading
 import unittest
 import warnings
 from io import BytesIO
@@ -1639,3 +1641,559 @@ def test_large_nifti1():
     assert image_shape == data.shape
     n_ones = np.sum(data == 1.0)
     assert np.prod(image_shape) == n_ones
+
+
+# ---------------------------------------------------------------------------
+# Explicit lazy_extensions loading mode
+# ---------------------------------------------------------------------------
+
+# A large payload that would be obvious if it were read during header scanning
+_LAZY_BIG_PAYLOAD = b'z' * 200
+_LAZY_EXT_SPECS = [
+    (6, b'comment one'),
+    # Unknown ecode with embedded NUL padding
+    (251, b'unknown block' + b'\x00' * 5),
+    (6, _LAZY_BIG_PAYLOAD),
+]
+
+
+def _make_lazy_test_file(fname, *, nifti2=False, endianness='<'):
+    """Write an uncompressed single-file NIfTI image with extensions."""
+    data = np.arange(24, dtype='f4').reshape(2, 3, 4)
+    if nifti2:
+        from nibabel.nifti2 import Nifti2Header, Nifti2Image
+        from nibabel.nifti2 import save as n2_save
+
+        hdr = Nifti2Header(endianness=endianness)
+        klass = Nifti2Image
+        save = n2_save
+    else:
+        hdr = Nifti1Header(endianness=endianness)
+        klass = Nifti1Image
+        save = nifti1.save
+    hdr.set_data_shape(data.shape)
+    hdr.set_data_dtype(data.dtype)
+    hdr.extensions[:] = [Nifti1Extension(code, payload) for code, payload in _LAZY_EXT_SPECS]
+    img = klass(data.astype(data.dtype.newbyteorder(endianness)), np.eye(4), header=hdr)
+    save(img, fname)
+    return data
+
+
+class _CountingLazyFile(nifti1._LazyExtensionFile):
+    """Lazy resource recording every open and every read request."""
+
+    instances = []
+
+    def __init__(self, filename):
+        self.read_calls = []
+        super().__init__(filename)
+        _CountingLazyFile.instances.append(self)
+
+    def read_at(self, offset, size, what='content'):
+        self.read_calls.append((offset, size, what))
+        return super().read_at(offset, size, what)
+
+
+@pytest.fixture
+def counting_lazy(monkeypatch):
+    _CountingLazyFile.instances = []
+    monkeypatch.setattr(nifti1, '_LazyExtensionFile', _CountingLazyFile)
+    return _CountingLazyFile
+
+
+def test_lazy_extensions_default_eager_loading_unchanged(tmp_path):
+    fname = str(tmp_path / 'example.nii')
+    _make_lazy_test_file(fname)
+    img = load(fname)
+    exts = img.header.extensions
+    # Default mode still builds plain, fully materialized extensions
+    assert type(exts) is Nifti1Extensions
+    assert all(type(e) is Nifti1Extension for e in exts)
+    assert exts.get_codes() == [6, 251, 6]
+    assert exts[0].content == b'comment one'
+    assert exts[2].content == _LAZY_BIG_PAYLOAD
+
+
+def test_lazy_extensions_reject_unsupported_sources(tmp_path):
+    fname = str(tmp_path / 'example.nii')
+    data = _make_lazy_test_file(fname)
+
+    # Compressed files (gzip / bz2) cannot hold an independent raw handle
+    for suffix in ('.nii.gz', '.nii.bz2'):
+        compressed = str(tmp_path / f'example{suffix}')
+        nifti1.save(Nifti1Image(data, np.eye(4)), compressed)
+        with pytest.raises(ValueError, match=r'[Cc]ompress'):
+            load(compressed, lazy_extensions=True)
+
+    # File-like objects cannot be held independently after the opener exits
+    with open(fname, 'rb') as fh:
+        fmap = Nifti1Image.make_file_map({'image': fh})
+        with pytest.raises(ValueError, match='filename'):
+            Nifti1Image.from_file_map(fmap, lazy_extensions=True)
+        # Caller cursor must be untouched by the rejected attempt
+        assert fh.tell() == 0
+
+    # Detached header/data pairs are not single files
+    pair_hdr = str(tmp_path / 'pair.hdr')
+    nifti1.save(Nifti1Pair(data, np.eye(4)), pair_hdr)
+    with pytest.raises(ValueError, match='single-file'):
+        load(pair_hdr, lazy_extensions=True)
+
+    # Non-NIfTI (analyze) headers do not support the mode; loading through the
+    # generic entry point rejects the mode with a clear message
+    from nibabel.analyze import AnalyzeImage
+
+    analyze_hdr = str(tmp_path / 'analyze.hdr')
+    AnalyzeImage(data, np.eye(4)).to_filename(analyze_hdr)
+    with pytest.raises(ValueError, match=r'single-file|not supported'):
+        load(analyze_hdr, lazy_extensions=True)
+
+
+def test_lazy_extensions_scan_reads_only_extension_headers(tmp_path, counting_lazy):
+    fname = str(tmp_path / 'example.nii')
+    _make_lazy_test_file(fname)
+    img = load(fname, lazy_extensions=True)
+    exts = img.header.extensions
+    try:
+        assert isinstance(exts, nifti1.Nifti1LazyExtensions)
+        assert exts.is_lazy
+        assert all(isinstance(e, nifti1.Nifti1LazyExtension) for e in exts)
+        # Exactly one independently opened resource, and only 8-byte headers
+        assert len(counting_lazy.instances) == 1
+        resource = counting_lazy.instances[0]
+        ext_start = 352
+        expected_scan = [
+            (ext_start, 8, 'header'),
+            (ext_start + 32, 8, 'header'),
+            (ext_start + 64, 8, 'header'),
+        ]
+        assert resource.read_calls == expected_scan
+        # No payload byte has been read at all
+        assert all(size == 8 for _, size, _ in resource.read_calls)
+
+        # Enumeration / metadata APIs must not trigger any payload read
+        assert exts.get_codes() == [6, 251, 6]
+        assert exts.count('comment') == 2
+        assert exts.get_codes().count(251) == 1
+        assert int(exts.get_sizeondisk()) == 272
+        assert all(not e.is_materialized for e in exts)
+        assert resource.read_calls == expected_scan
+
+        # repr must not force materialization either
+        assert all('<lazy' in repr(e) for e in exts)
+        assert resource.read_calls == expected_scan
+    finally:
+        exts.release()
+
+
+def test_lazy_extensions_access_reads_only_that_range(tmp_path, counting_lazy):
+    fname = str(tmp_path / 'example.nii')
+    _make_lazy_test_file(fname)
+    img = load(fname, lazy_extensions=True)
+    exts = img.header.extensions
+    try:
+        resource = counting_lazy.instances[0]
+        # Accessing one item reads exactly its payload range (esize - 8)
+        assert exts[0].content == b'comment one'
+        assert resource.read_calls[-1] == (352 + 8, 32 - 8, 'content')
+        assert len(resource.read_calls) == 4
+        # The big payload has not been touched
+        assert all(size != 200 for _, size, _ in resource.read_calls)
+
+        # Repeated access is served from the materialized cache: no new I/O
+        assert exts[0].content == b'comment one'
+        assert exts[0].get_object() == b'comment one'
+        assert len(resource.read_calls) == 4
+
+        # get_object / get_content / text follow the same lazy path
+        assert exts[1].get_object() == b'unknown block'
+        assert resource.read_calls[-1] == (384 + 8, 32 - 8, 'content')
+        assert exts[2].get_content() == _LAZY_BIG_PAYLOAD
+        assert resource.read_calls[-1] == (416 + 8, 208 - 8, 'content')
+        # Every entry has materialized into the standard handler class
+        assert all(type(e) is Nifti1Extension for e in exts)
+    finally:
+        exts.release()
+
+
+def test_lazy_extensions_materialization_matches_eager(tmp_path):
+    fname = str(tmp_path / 'example.nii')
+    _make_lazy_test_file(fname)
+    eager = load(fname).header.extensions
+    lazy_img = load(fname, lazy_extensions=True)
+    lazy = lazy_img.header.extensions
+    try:
+        for e_ext, l_ext in zip(eager, lazy):
+            assert l_ext.get_code() == e_ext.get_code()
+            assert l_ext.get_sizeondisk() == e_ext.get_sizeondisk()
+            assert l_ext.content == e_ext.content
+            assert l_ext.get_object() == e_ext.get_object()
+    finally:
+        lazy.release()
+
+
+def test_lazy_extensions_copy_shares_resource_and_release_isolates(tmp_path):
+    fname = str(tmp_path / 'example.nii')
+    _make_lazy_test_file(fname)
+    img = load(fname, lazy_extensions=True)
+    exts = img.header.extensions
+    source = exts._source
+    try:
+        # header.copy, from_header and deepcopy all share the source via refs
+        copies = [
+            img.header.copy().extensions,
+            Nifti1Header.from_header(img.header).extensions,
+            copy.deepcopy(img.header).extensions,
+        ]
+        for copied in copies:
+            assert isinstance(copied, nifti1.Nifti1LazyExtensions)
+            assert copied._source is source
+            assert not source.closed
+        # Releasing one header's resource leaves the copies usable
+        exts.release()
+        assert exts._released
+        assert not source.closed
+        for copied in copies:
+            assert copied[0].content == b'comment one'
+        # Releasing the remaining copies eventually closes the shared handle
+        for copied in copies:
+            copied.release()
+        assert source.closed
+        # Post-release access to an unmateralized entry gives a clear error
+        with pytest.raises(RuntimeError, match='released'):
+            exts[1].content
+        # release is idempotent
+        exts.release()
+    finally:
+        exts.release()
+        for copied in copies:
+            copied.release()
+
+
+def test_lazy_extensions_materialized_content_survives_release(tmp_path):
+    fname = str(tmp_path / 'example.nii')
+    _make_lazy_test_file(fname)
+    img = load(fname, lazy_extensions=True)
+    exts = img.header.extensions
+    first = exts[0].content  # materialize before release
+    exts.release()
+    # Materialized entries no longer depend on the source
+    assert exts[0].content == first
+    # Pristine entries fail with a clear error instead of silent corruption
+    with pytest.raises(RuntimeError, match='released'):
+        exts[1].content
+
+
+def test_lazy_extensions_open_source_only_once(tmp_path, counting_lazy):
+    fname = str(tmp_path / 'example.nii')
+    _make_lazy_test_file(fname)
+    img = load(fname, lazy_extensions=True)
+    exts = img.header.extensions
+    try:
+        # Copies and repeated materialization must never reopen the filename
+        copied = img.header.copy().extensions
+        for i in range(3):
+            exts[0].content
+            exts[1].content
+        copied[2].content
+        assert len(counting_lazy.instances) == 1
+        copied.release()
+    finally:
+        exts.release()
+
+
+@pytest.mark.skipif(os.name == 'nt', reason='open files cannot be replaced on Windows')
+def test_lazy_extensions_held_handle_survives_path_replacement(tmp_path):
+    fname = str(tmp_path / 'example.nii')
+    _make_lazy_test_file(fname)
+    img = load(fname, lazy_extensions=True)
+    exts = img.header.extensions
+    try:
+        # Put a completely different image at the same path
+        other = str(tmp_path / 'other.nii')
+        nifti1.save(Nifti1Image(np.zeros((2, 3, 4), 'f4'), np.eye(4)), other)
+        os.replace(other, fname)
+        # The held handle must still expose the original payload rather than
+        # reopening the path and reading the replacement file
+        assert exts[0].content == b'comment one'
+        assert exts[2].content == _LAZY_BIG_PAYLOAD
+    finally:
+        exts.release()
+
+
+def test_lazy_extensions_byteorder_and_nifti1_nifti2_offsets(tmp_path):
+    from nibabel.nifti2 import load as nifti2_load
+    from nibabel.nifti2 import save as nifti2_save
+
+    for nifti2, endianness, ext_start in (
+        (False, '<', 352),
+        (False, '>', 352),
+        (True, '<', 544),
+        (True, '>', 544),
+    ):
+        tag = 'le' if endianness == '<' else 'be'
+        fname = str(tmp_path / f'img_{nifti2}_{tag}.nii')
+        _make_lazy_test_file(fname, nifti2=nifti2, endianness=endianness)
+        loader = nifti2_load if nifti2 else load
+        img = loader(fname, lazy_extensions=True)
+        exts = img.header.extensions
+        try:
+            assert img.header.endianness == endianness
+            assert exts.get_codes() == [6, 251, 6]
+            # Correct header offsets for NIfTI1 vs NIfTI2
+            assert [e._offset for e in exts] == [
+                ext_start,
+                ext_start + 32,
+                ext_start + 64,
+            ]
+            assert exts[0].content == b'comment one'
+            assert exts[1].content == b'unknown block'
+            assert exts[2].content == _LAZY_BIG_PAYLOAD
+            # Pristine write-back of a byte-swapped file round-trips
+            out = str(tmp_path / f'out_{nifti2}_{tag}.nii')
+            (nifti2_save if nifti2 else nifti1.save)(img, out)
+            rt = loader(out)
+            assert rt.header.endianness == endianness
+            assert [e.content for e in rt.header.extensions] == [
+                b'comment one',
+                b'unknown block',
+                _LAZY_BIG_PAYLOAD,
+            ]
+        finally:
+            exts.release()
+
+
+def test_lazy_extensions_unknown_ecode_is_copied_verbatim(tmp_path):
+    fname = str(tmp_path / 'example.nii')
+    _make_lazy_test_file(fname)
+    with open(fname, 'rb') as fh:
+        original = fh.read()
+    img = load(fname, lazy_extensions=True)
+    exts = img.header.extensions
+    try:
+        # Never materialize anything: unknown content and padding must be
+        # streamed back byte-for-byte in chunks
+        out = str(tmp_path / 'copy.nii')
+        nifti1.save(img, out)
+        with open(out, 'rb') as fh:
+            saved = fh.read()
+        assert saved == original
+    finally:
+        exts.release()
+    # Eager reload sees the same (NUL-stripped) content
+    rt = load(out)
+    assert rt.header.extensions[1].get_code() == 251
+    assert rt.header.extensions[1].content == b'unknown block'
+
+
+def test_lazy_extensions_edit_then_save_uses_serialization_rules(tmp_path):
+    fname = str(tmp_path / 'example.nii')
+    _make_lazy_test_file(fname)
+    img = load(fname, lazy_extensions=True)
+    exts = img.header.extensions
+    try:
+        # Replace a known extension; leave the others pristine
+        exts[0] = Nifti1Extension(6, b'edited comment')
+        out = str(tmp_path / 'edited.nii')
+        nifti1.save(img, out)
+    finally:
+        exts.release()
+    rt = load(out)
+    assert rt.header.extensions[0].content == b'edited comment'
+    # Pristine unknown and big extensions are preserved untouched
+    assert rt.header.extensions[1].content == b'unknown block'
+    assert rt.header.extensions[2].content == _LAZY_BIG_PAYLOAD
+
+    # An edited runtime object must override any cached raw bytes on save
+    img2 = load(fname, lazy_extensions=True)
+    exts2 = img2.header.extensions
+    try:
+        obj = exts2[0].get_object()
+        assert obj == b'comment one'
+        exts2[0]._object = b'object wins'
+        out2 = str(tmp_path / 'edited2.nii')
+        nifti1.save(img2, out2)
+    finally:
+        exts2.release()
+    rt2 = load(out2)
+    assert rt2.header.extensions[0].content == b'object wins'
+    assert rt2.header.extensions[1].content == b'unknown block'
+
+
+def test_lazy_extensions_save_reload_keeps_alignment_and_data_start(tmp_path):
+    fname = str(tmp_path / 'example.nii')
+    data = _make_lazy_test_file(fname)
+    img = load(fname, lazy_extensions=True)
+    exts = img.header.extensions
+    try:
+        out = str(tmp_path / 'roundtrip.nii')
+        nifti1.save(img, out)
+    finally:
+        exts.release()
+    eager_before = load(fname)
+    rt = load(out)
+    # Extension contents, alignment and image data start all stay consistent
+    assert [e.content for e in rt.header.extensions] == [
+        e.content for e in eager_before.header.extensions
+    ]
+    assert int(rt.header.extensions.get_sizeondisk()) % 16 == 0
+    assert rt.dataobj.offset == eager_before.dataobj.offset == 624
+    assert_array_equal(np.asanyarray(rt.dataobj), data)
+
+
+@pytest.mark.parametrize(
+    ('mutate', 'message'),
+    [
+        (lambda raw: raw[:352], 'beyond the end of the file'),
+        (lambda raw: raw[:356], 'beyond the end of the file'),
+        (lambda raw: raw[:362], 'beyond the end of the file'),
+    ],
+)
+def test_lazy_extensions_short_files(tmp_path, mutate, message):
+    fname = str(tmp_path / 'example.nii')
+    _make_lazy_test_file(fname)
+    with open(fname, 'rb') as fh:
+        raw = fh.read()
+    bad = str(tmp_path / 'bad.nii')
+    with open(bad, 'wb') as fh:
+        fh.write(mutate(bytearray(raw)))
+    with pytest.raises(HeaderDataError, match=message):
+        load(bad, lazy_extensions=True)
+
+
+def test_lazy_extensions_malformed_extension_headers(tmp_path):
+    fname = str(tmp_path / 'example.nii')
+    _make_lazy_test_file(fname)
+    with open(fname, 'rb') as fh:
+        raw = fh.read()
+
+    def rewrite(bad_fname, esize_bytes=None, vox_offset=None):
+        buf = bytearray(raw)
+        if esize_bytes is not None:
+            buf[352:356] = esize_bytes
+        if vox_offset is not None:
+            buf[108:112] = struct.pack('<f', vox_offset)
+        with open(bad_fname, 'wb') as fh:
+            fh.write(buf)
+
+    # Non-positive esize must not loop or allocate
+    rewrite(str(tmp_path / 'zero.nii'), esize_bytes=struct.pack('<i', 0))
+    with pytest.raises(HeaderDataError, match='positive integer'):
+        load(str(tmp_path / 'zero.nii'), lazy_extensions=True)
+    rewrite(str(tmp_path / 'neg.nii'), esize_bytes=struct.pack('<i', -16))
+    with pytest.raises(HeaderDataError, match='positive integer'):
+        load(str(tmp_path / 'neg.nii'), lazy_extensions=True)
+    # esize below the 8 byte header
+    rewrite(str(tmp_path / 'seven.nii'), esize_bytes=struct.pack('<i', 7))
+    with pytest.raises(HeaderDataError, match='at least 8'):
+        load(str(tmp_path / 'seven.nii'), lazy_extensions=True)
+    # esize claiming more than the region up to vox_offset
+    rewrite(str(tmp_path / 'huge.nii'), esize_bytes=struct.pack('<i', 10**8))
+    with pytest.raises(HeaderDataError, match='vox_offset'):
+        load(str(tmp_path / 'huge.nii'), lazy_extensions=True)
+    # Shrinking vox_offset makes the second extension cross the data start
+    rewrite(str(tmp_path / 'cross.nii'), vox_offset=400)
+    with pytest.raises(HeaderDataError, match='vox_offset'):
+        load(str(tmp_path / 'cross.nii'), lazy_extensions=True)
+
+    # A non-16-multiple esize warns (same behavior as eager mode) but loads.
+    # Build a self-consistent single-extension file with esize 24 and move
+    # vox_offset to match so nothing crosses the data start.
+    single_fname = str(tmp_path / 'single.nii')
+    single_img = Nifti1Image(
+        np.arange(6, dtype='f4'),
+        np.eye(4),
+        header=Nifti1Header(),
+    )
+    single_img.header.extensions[:] = [Nifti1Extension(6, b'comment one')]
+    nifti1.save(single_img, single_fname)
+    with open(single_fname, 'rb') as fh:
+        single_buf = bytearray(fh.read())
+    single_buf[352:356] = struct.pack('<i', 24)  # esize not multiple of 16
+    single_buf[108:112] = struct.pack('<f', 352 + 24)
+    warn_fname = str(tmp_path / 'warn.nii')
+    with open(warn_fname, 'wb') as fh:
+        fh.write(single_buf)
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter('always')
+        img = load(warn_fname, lazy_extensions=True)
+    try:
+        assert any(issubclass(w.category, UserWarning) for w in caught)
+        assert img.header.extensions.get_codes() == [6]
+        assert img.header.extensions[0].content == b'comment one'
+    finally:
+        img.header.extensions.release()
+
+
+def test_lazy_extensions_concurrent_reads_are_safe(tmp_path):
+    fname = str(tmp_path / 'example.nii')
+    _make_lazy_test_file(fname)
+    img = load(fname, lazy_extensions=True)
+    exts = img.header.extensions
+    expected = [b'comment one', b'unknown block', _LAZY_BIG_PAYLOAD]
+    try:
+        results, errors = [], []
+        barrier = threading.Barrier(8)
+
+        def worker():
+            barrier.wait()
+            try:
+                for repeat in range(100):
+                    index = repeat % 3
+                    results.append((index, exts[index].content))
+            except Exception as exc:
+                errors.append(exc)
+
+        threads = [threading.Thread(target=worker) for _ in range(8)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        assert errors == []
+        assert len(results) == 800
+        assert all(content == expected[index % 3] for index, content in results)
+
+        # Hammer a single entry concurrently: materialization must happen once,
+        # with no double release of the shared source reference
+        fresh = load(fname, lazy_extensions=True)
+        fresh_exts = fresh.header.extensions
+        source = fresh_exts._source
+        single_errors = []
+        barrier = threading.Barrier(8)
+
+        def single_worker():
+            barrier.wait()
+            try:
+                assert fresh_exts[0].content == b'comment one'
+            except Exception as exc:
+                single_errors.append(exc)
+
+        single_threads = [threading.Thread(target=single_worker) for _ in range(8)]
+        for thread in single_threads:
+            thread.start()
+        for thread in single_threads:
+            thread.join()
+        assert single_errors == []
+        # Other entries and the shared resource remain fully functional
+        assert fresh_exts[1].content == b'unknown block'
+        assert not source.closed
+        fresh_exts.release()
+        assert source.closed
+    finally:
+        exts.release()
+
+
+def test_lazy_extensions_do_not_move_other_file_cursors(tmp_path):
+    fname = str(tmp_path / 'example.nii')
+    _make_lazy_test_file(fname)
+    img = load(fname, lazy_extensions=True)
+    exts = img.header.extensions
+    try:
+        with open(fname, 'rb') as other:
+            other.seek(77)
+            assert exts[0].content == b'comment one'
+            assert exts[2].content == _LAZY_BIG_PAYLOAD
+            # The independently opened lazy handle never touches this cursor
+            assert other.tell() == 77
+    finally:
+        exts.release()

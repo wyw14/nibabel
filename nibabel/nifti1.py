@@ -14,8 +14,11 @@ NIfTI1 format defined at http://nifti.nimh.nih.gov/nifti-1/
 from __future__ import annotations
 
 import json
+import os
+import threading
 import typing as ty
 import warnings
+from copy import copy as _shallow_copy
 from io import BytesIO
 
 import numpy as np
@@ -793,6 +796,377 @@ class Nifti1Extensions(list):
         return extensions
 
 
+class _LazyExtensionFile:
+    """Independently opened, reference counted source file for lazy extensions.
+
+    The file is opened exactly once for a lazy load and the resulting binary
+    handle is shared (with reference counting) by every header and extension
+    copied from that load.  The filename is never reopened, so replacing the
+    file at the path cannot make lazy entries read a different file.  All
+    positioning and reading is serialized with a lock to make concurrent lazy
+    reads safe.
+
+    Notes
+    -----
+    Lazy extension loading does not provide snapshot consistency if the source
+    file is modified in place while being read; callers must keep the source
+    content stable for the lifetime of the lazy resource.
+    """
+
+    #: Chunk size used when streaming extension bytes back to disk
+    chunk_size = 1 << 20
+
+    def __init__(self, filename: str) -> None:
+        self.filename = filename
+        self._fobj = open(filename, 'rb')
+        self._io_lock = threading.Lock()
+        self._ref_lock = threading.Lock()
+        self._refs = 0
+        self.closed = False
+
+    def acquire(self) -> None:
+        """Take a reference on the shared file resource."""
+        with self._ref_lock:
+            if self.closed:
+                raise RuntimeError(
+                    f'Lazy extension resource {self.filename!r} has already been released'
+                )
+            self._refs += 1
+
+    def release(self) -> None:
+        """Drop a reference; close the handle when the last reference drops."""
+        with self._ref_lock:
+            if self.closed:
+                return
+            if self._refs > 0:
+                self._refs -= 1
+            if self._refs:
+                return
+            self.closed = True
+        with self._io_lock:
+            self._fobj.close()
+
+    @property
+    def file_size(self) -> int:
+        # fstat does not move the underlying file cursor
+        return os.fstat(self._fobj.fileno()).st_size
+
+    def _check_open(self) -> None:
+        if self.closed:
+            raise RuntimeError(
+                f'Cannot read NIfTI extension payload: the lazy extension '
+                f'resource {self.filename!r} has been released. Materialize '
+                'the extension (via .content or .get_object()) before '
+                'releasing the resource, or reload the image.'
+            )
+
+    def read_at(self, offset: int, size: int, what: str = 'content') -> bytes:
+        """Read exactly *size* bytes at absolute *offset*, under the IO lock."""
+        with self._io_lock:
+            self._check_open()
+            self._fobj.seek(offset)
+            data = self._fobj.read(size)
+        if len(data) != size:
+            raise HeaderDataError(f'failed to read extension {what}')
+        return data
+
+    def copy_at(self, offset: int, size: int, fileobj: ty.BinaryIO) -> None:
+        """Stream *size* bytes at *offset* into *fileobj* in fixed chunks."""
+        with self._io_lock:
+            self._check_open()
+            self._fobj.seek(offset)
+            remaining = size
+            while remaining:
+                chunk = self._fobj.read(min(self.chunk_size, remaining))
+                if not chunk:
+                    raise HeaderDataError('failed to read extension content')
+                fileobj.write(chunk)
+                remaining -= len(chunk)
+
+
+class Nifti1LazyExtension(Nifti1Extension[T]):
+    """NIfTI extension with payload deferred until first content access.
+
+    Only the on-disk location (absolute offset and ``esize``) and the
+    extension code are known at load time; the payload itself is neither read
+    nor decoded until :attr:`content` or :meth:`get_object` is first accessed.
+    Accessing the payload materializes the entry in place into the regular
+    extension handler class, after which it no longer depends on the source
+    file resource.
+    """
+
+    def __init__(
+        self,
+        source: _LazyExtensionFile,
+        offset: int,
+        esize: int,
+        code: int,
+        byteswap: bool,
+        handler: type[Nifti1Extension],
+    ) -> None:
+        self.code = int(code)
+        self._raw: bytes | None = None
+        self._object: T | None = None
+        self._source = source
+        #: Absolute offset of the 8 byte (esize, ecode) header in the source
+        self._offset = int(offset)
+        #: Full on-disk size, including the 8 byte header and padding
+        self._esize = int(esize)
+        self._byteswap = bool(byteswap)
+        self._handler = handler
+        self._holds_ref = True
+        self._materialize_lock = threading.Lock()
+        source.acquire()
+
+    def __repr__(self) -> str:
+        try:
+            code = extension_codes.label[self.code]
+        except KeyError:
+            code = self.code
+        return f'{self.__class__.__name__}({code}, <lazy, on-disk esize={self._esize}>)'
+
+    def __copy__(self) -> Self:
+        source = self._source
+        if source is not None and not source.closed:
+            return self.__class__(
+                source,
+                self._offset,
+                self._esize,
+                self.code,
+                self._byteswap,
+                self._handler,
+            )
+        # The source has been released: keep a stub that raises the same clear
+        # error on access instead of resurrecting a closed resource.
+        new = self.__class__.__new__(self.__class__)
+        new.__dict__.update(self.__dict__)
+        new._holds_ref = False
+        return new
+
+    __deepcopy__ = __copy__
+
+    def __del__(self) -> None:
+        try:
+            if getattr(self, '_holds_ref', False) and self._source is not None:
+                self._holds_ref = False
+                self._source.release()
+        except Exception:
+            pass
+
+    @property
+    def is_materialized(self) -> bool:
+        """True once the payload has been read and decoded."""
+        return self._source is None
+
+    def _require_open_source(self) -> None:
+        if self._source is None or self._source.closed:
+            raise RuntimeError(
+                f'NIfTI extension with ecode {self.code} cannot be read: the '
+                'lazy extension source file has been released. Access '
+                '.content or .get_object() before releasing the resource, or '
+                'reload the image.'
+            )
+
+    def _materialize(self) -> None:
+        """Read the payload and turn this entry into a normal extension."""
+        with self._materialize_lock:
+            # Another thread may have materialized while we waited for the lock
+            if self._source is None:
+                return
+            self._require_open_source()
+            source = self._source
+            # This reads only this entry's payload range, never the whole
+            # extension area.
+            raw = source.read_at(self._offset + 8, self._esize - 8)
+            raw = raw.rstrip(b'\x00')
+            handler = self._handler
+            # Same construction path as eager Nifti1Extensions.from_fileobj
+            built = handler(self.code, raw)
+            # Drop the source dependency before swapping class/state
+            self._holds_ref = False
+            source.release()
+            materialized_dict = built.__dict__
+            self.__class__ = handler
+            self.__dict__.clear()
+            self.__dict__.update(materialized_dict)
+
+    @property
+    def content(self) -> bytes:
+        self._materialize()
+        return NiftiExtension.content.fget(self)
+
+    def get_object(self) -> T:
+        self._materialize()
+        return NiftiExtension.get_object(self)
+
+    # Backwards compatibility alias, rebound to the lazy get_object
+    get_content = get_object
+
+    def get_sizeondisk(self) -> int:
+        """Return the on-disk size without touching the payload."""
+        return self._esize
+
+    def write_to(self, fileobj: ty.BinaryIO, byteswap: bool = False) -> None:
+        """Write the pristine extension by copying its original on-disk bytes.
+
+        The full block (esize/ecode header, payload and trailing padding) is
+        streamed verbatim in chunks, so unknown or never-materialized
+        extensions cannot lose content. Materialized entries use the standard
+        :class:`Nifti1Extension` serialization instead.
+        """
+        self._require_open_source()
+        self._source.copy_at(self._offset, self._esize, fileobj)
+
+
+class Nifti1LazyExtensions(Nifti1Extensions):
+    """Extension collection whose payloads stay on disk until first access.
+
+    A lazily loaded collection holds a shared, independently opened
+    :class:`_LazyExtensionFile`. Copying the collection (for example when a
+    header is copied) shares the same source and takes additional references;
+    :meth:`release` drops the references of one collection without invalidating
+    other copies that still hold references.
+    """
+
+    def __init__(self, iterable: ty.Iterable = (), source: _LazyExtensionFile | None = None):
+        if source is None and isinstance(iterable, Nifti1LazyExtensions):
+            source = iterable._source
+        self._source = source
+        self._released = False
+        if source is not None and not source.closed:
+            source.acquire()
+        super().__init__([])
+        for item in iterable:
+            self.append(self._share_item(item))
+
+    @staticmethod
+    def _share_item(item: ty.Any) -> ty.Any:
+        if isinstance(item, Nifti1LazyExtension):
+            return _shallow_copy(item)
+        return item
+
+    def __copy__(self) -> Self:
+        return self.__class__(self)
+
+    def __deepcopy__(self, memo: dict) -> Self:
+        new = self.__class__(self)
+        memo[id(self)] = new
+        return new
+
+    def __del__(self) -> None:
+        try:
+            self.release()
+        except Exception:
+            pass
+
+    @property
+    def is_lazy(self) -> bool:
+        """True while this collection owns a live lazy source file."""
+        return self._source is not None and not self._released
+
+    def release(self) -> None:
+        """Release the shared source file resource.
+
+        Idempotent. Extensions that were already materialized keep working and
+        remain independent of the source file; accessing the payload of a
+        still-lazy extension afterwards raises a clear :class:`RuntimeError`.
+        Other collections sharing the source keep it open until they release
+        their own references.
+        """
+        if self._released:
+            return
+        self._released = True
+        source = self._source
+        self._source = None
+        if source is None:
+            return
+        for item in self:
+            if isinstance(item, Nifti1LazyExtension) and item._holds_ref:
+                item._holds_ref = False
+                source.release()
+        # Drop the collection's own reference last
+        source.release()
+
+    @classmethod
+    def scan(
+        klass,
+        filename: str,
+        ext_start: int,
+        extsize: int,
+        byteswap: bool,
+    ) -> Self:
+        """Scan extension (esize, ecode) headers without reading payloads.
+
+        Only the 8 byte extension headers are read; every extension position
+        and length is validated against the file boundary and ``vox_offset``
+        (the image data start) before a lazy entry is created.
+
+        Parameters
+        ----------
+        filename : str
+            Source file, opened independently for later payload reads.
+        ext_start : int
+            Absolute offset of the first extension in *filename*.
+        extsize : int
+            Number of bytes available between *ext_start* and the image data.
+        byteswap : bool
+            Whether the extension headers are byte-swapped relative to the
+            native endianness.
+        """
+        extsize = int(extsize)
+        if extsize < 0:
+            raise HeaderDataError('vox_offset points before the start of the extensions')
+        source = _LazyExtensionFile(filename)
+        extensions = klass(source=source)
+        try:
+            file_size = source.file_size
+            if int(ext_start) + extsize > file_size:
+                raise HeaderDataError('extension region extends beyond the end of the file')
+            pos = int(ext_start)
+            remaining = extsize
+            while remaining >= 16:
+                # Read only the 8 byte (esize, ecode) header, never payload
+                ext_def = source.read_at(pos, 8, what='header')
+                ext_def_arr = np.frombuffer(ext_def, dtype=np.int32)
+                if byteswap:
+                    ext_def_arr = ext_def_arr.byteswap()
+                ecode = int(ext_def_arr[1])
+                esize = int(ext_def_arr[0])
+                # Reject non-positive progress up front to avoid loops or
+                # huge allocations from corrupted headers
+                if esize <= 0:
+                    raise HeaderDataError('extension size must be a positive integer')
+                if esize < 8:
+                    raise HeaderDataError('extension size must be at least 8 bytes')
+                if esize % 16:
+                    warnings.warn(
+                        'Extension size is not a multiple of 16 bytes; '
+                        'Assuming size is correct and hoping for the best',
+                        UserWarning,
+                    )
+                if esize > remaining:
+                    raise HeaderDataError(
+                        'extension extends beyond vox_offset (the start of the image data)'
+                    )
+                if pos + esize > file_size:
+                    raise HeaderDataError('extension content is truncated at the end of the file')
+                try:
+                    handler = extension_codes.handler[ecode]
+                except KeyError:
+                    # Unknown extension type: keep generic handling, but
+                    # preserve raw bytes verbatim on write back
+                    handler = Nifti1Extension
+                extensions.append(
+                    Nifti1LazyExtension(source, pos, esize, ecode, byteswap, handler)
+                )
+                pos += esize
+                remaining -= esize
+            return extensions
+        except BaseException:
+            extensions.release()
+            raise
+
+
 class Nifti1Header(SpmAnalyzeHeader):
     """Class for NIfTI1 header
 
@@ -828,6 +1202,9 @@ class Nifti1Header(SpmAnalyzeHeader):
     # ``from_fileobj`` for reading from file
     exts_klass = Nifti1Extensions
 
+    # Whether the explicit ``lazy_extensions`` loading mode may be used
+    supports_lazy_extensions = True
+
     # Signal whether this is single (header + data) file
     is_single = True
 
@@ -845,7 +1222,12 @@ class Nifti1Header(SpmAnalyzeHeader):
     def __init__(self, binaryblock=None, endianness=None, check=True, extensions=()):
         """Initialize header from binary data block and extensions"""
         super().__init__(binaryblock, endianness, check)
-        self.extensions = self.exts_klass(extensions)
+        # Lazy collections carry a shared source file; preserve the sharing
+        # instead of wrapping them in a plain collection
+        if isinstance(extensions, Nifti1LazyExtensions):
+            self.extensions = Nifti1LazyExtensions(extensions)
+        else:
+            self.extensions = self.exts_klass(extensions)
 
     def copy(self):
         """Return copy of header
@@ -855,7 +1237,15 @@ class Nifti1Header(SpmAnalyzeHeader):
         return self.__class__(self.binaryblock, self.endianness, False, self.extensions)
 
     @classmethod
-    def from_fileobj(klass, fileobj, endianness=None, check=True):
+    def from_fileobj(
+        klass,
+        fileobj,
+        endianness=None,
+        check=True,
+        *,
+        lazy_extensions=False,
+        lazy_filename=None,
+    ):
         raw_str = fileobj.read(klass.template_dtype.itemsize)
         hdr = klass(raw_str, endianness, check)
         # Read next 4 bytes to see if we have extensions.  The nifti standard
@@ -870,9 +1260,28 @@ class Nifti1Header(SpmAnalyzeHeader):
         if not klass.is_single:
             extsize = -1
         else:  # otherwise read until the beginning of the data
-            extsize = hdr._structarr['vox_offset'] - fileobj.tell()
+            extsize = int(hdr._structarr['vox_offset']) - fileobj.tell()
         byteswap = endian_codes['native'] != hdr.endianness
-        hdr.extensions = klass.exts_klass.from_fileobj(fileobj, extsize, byteswap)
+        if lazy_extensions:
+            if not klass.is_single:
+                raise ValueError(
+                    'lazy_extensions is only supported for single-file '
+                    'NIfTI-1/2 images, not detached header/data pairs'
+                )
+            if not isinstance(lazy_filename, str):
+                raise ValueError(
+                    'lazy_extensions requires a filename so that the source '
+                    'file can be opened and held independently'
+                )
+            ext_start = fileobj.tell()
+            # Only the 8 byte extension headers are read here; payload reads
+            # are deferred until individual extensions are accessed
+            hdr.extensions = Nifti1LazyExtensions.scan(lazy_filename, ext_start, extsize, byteswap)
+            # Leave the transient stream where eager reading would have left
+            # it (at vox_offset) without reading any payload from it
+            fileobj.seek(ext_start + extsize)
+        else:
+            hdr.extensions = klass.exts_klass.from_fileobj(fileobj, extsize, byteswap)
         return hdr
 
     def write_to(self, fileobj):
@@ -939,7 +1348,11 @@ class Nifti1Header(SpmAnalyzeHeader):
         """
         new_hdr = super().from_header(header, check)
         if isinstance(header, Nifti1Header):
-            new_hdr.extensions[:] = header.extensions[:]
+            if isinstance(header.extensions, Nifti1LazyExtensions):
+                # Share the independently held source via fresh references
+                new_hdr.extensions = Nifti1LazyExtensions(header.extensions)
+            else:
+                new_hdr.extensions[:] = header.extensions[:]
         return new_hdr
 
     def get_data_shape(self):
@@ -2432,13 +2845,16 @@ class Nifti1Image(Nifti1Pair, SerializableImage):
         hdr['magic'] = hdr.single_magic
 
 
-def load(filename):
+def load(filename, **kwargs):
     """Load NIfTI1 single or pair from `filename`
 
     Parameters
     ----------
     filename : str
         filename of image to be loaded
+    \*\*kwargs : keyword arguments
+        Keyword arguments to format-specific load, such as
+        ``lazy_extensions=True`` for deferred extension payload reads.
 
     Returns
     -------
@@ -2453,9 +2869,9 @@ def load(filename):
         if `filename` does not exist.
     """
     try:
-        img = Nifti1Image.load(filename)
+        img = Nifti1Image.load(filename, **kwargs)
     except ImageFileError:
-        return Nifti1Pair.load(filename)
+        return Nifti1Pair.load(filename, **kwargs)
     return img
 
 

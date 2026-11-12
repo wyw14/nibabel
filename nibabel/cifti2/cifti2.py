@@ -1498,7 +1498,7 @@ class Cifti2Image(DataobjImage, SerializableImage):
         return self._nifti_header
 
     @classmethod
-    def from_file_map(klass, file_map, *, mmap=True, keep_file_open=None):
+    def from_file_map(klass, file_map, *, mmap=True, keep_file_open=None, lazy_extensions=False):
         """Load a CIFTI-2 image from a file_map
 
         Parameters
@@ -1512,6 +1512,11 @@ class Cifti2Image(DataobjImage, SerializableImage):
         """
         from .parse_cifti2 import Cifti2Extension, _Cifti2AsNiftiImage
 
+        if lazy_extensions:
+            raise ValueError(
+                'lazy_extensions is not supported for CIfTI-2 images, which '
+                'require their CIFTI extension to be materialized at load time'
+            )
         nifti_img = _Cifti2AsNiftiImage.from_file_map(
             file_map, mmap=mmap, keep_file_open=keep_file_open
         )

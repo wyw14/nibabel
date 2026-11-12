@@ -470,12 +470,13 @@ class DataobjImage(FileBasedImage):
         *,
         mmap: bool | ty.Literal['c', 'r'] = True,
         keep_file_open: bool | None = None,
+        lazy_extensions: bool = False,
     ) -> Self:
         """Class method to create image from filename `filename`
 
         Parameters
         ----------
-        filename : str
+        filename : str or os.PathLike
             Filename of image to load
         mmap : {True, False, 'c', 'r'}, optional, keyword only
             `mmap` controls the use of numpy memory mapping for reading image
@@ -490,8 +491,13 @@ class DataobjImage(FileBasedImage):
             created and used for the lifetime of this ``ArrayProxy``. If
             ``True``, a single file handle is created and used. If ``False``,
             a new file handle is created every time the image is accessed.
-            The default value (``None``) will result in the value of
+            If ``file_map`` refers to an open file handle, this setting has no
+            effect. The default value (``None``) will result in the value of
             ``nibabel.arrayproxy.KEEP_FILE_OPEN_DEFAULT`` being used.
+        lazy_extensions : bool, keyword only, optional
+            If True, defer reading NIfTI header extension payloads until they
+            are first accessed. Only supported for uncompressed single-file
+            NIfTI-1/2 images loaded from a filename.
 
         Returns
         -------
@@ -500,6 +506,11 @@ class DataobjImage(FileBasedImage):
         if mmap not in (True, False, 'c', 'r'):
             raise ValueError("mmap should be one of {True, False, 'c', 'r'}")
         file_map = klass.filespec_to_file_map(filename)
-        return klass.from_file_map(file_map, mmap=mmap, keep_file_open=keep_file_open)
+        # Only forward the opt-in flag so image classes with their own
+        # from_file_map signatures keep working with the default eager mode
+        load_kwargs = dict(mmap=mmap, keep_file_open=keep_file_open)
+        if lazy_extensions:
+            load_kwargs['lazy_extensions'] = True
+        return klass.from_file_map(file_map, **load_kwargs)
 
     load = from_filename

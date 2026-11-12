@@ -84,12 +84,15 @@ constrain the affine.
 
 from __future__ import annotations
 
+import os
+
 import numpy as np
 
 from .arrayproxy import ArrayProxy
 from .arraywriters import ArrayWriter, WriterError, get_slope_inter, make_array_writer
 from .batteryrunners import Report
 from .fileholders import copy_file_map
+from .filename_parser import splitext_addext
 from .spatialimages import HeaderDataError, HeaderTypeError, SpatialHeader, SpatialImage
 from .volumeutils import (
     apply_read_scaling,
@@ -926,7 +929,14 @@ class AnalyzeImage(SpatialImage):
         self._header.set_data_dtype(dtype)
 
     @classmethod
-    def from_file_map(klass, file_map, *, mmap=True, keep_file_open=None):
+    def from_file_map(
+        klass,
+        file_map,
+        *,
+        mmap=True,
+        keep_file_open=None,
+        lazy_extensions=False,
+    ):
         """Class method to create image from mapping in ``file_map``
 
         Parameters
@@ -951,6 +961,12 @@ class AnalyzeImage(SpatialImage):
             If ``file_map`` refers to an open file handle, this setting has no
             effect. The default value (``None``) will result in the value of
             ``nibabel.arrayproxy.KEEP_FILE_OPEN_DEFAULT`` being used.
+        lazy_extensions : bool, keyword only, optional
+            If True, read NIfTI header extensions lazily: only the extension
+            (esize, ecode) headers are scanned at load time and each payload is
+            read on first access from an independently held, uncompressed
+            single-file source. Compressed files, file-like objects and image
+            types that do not support lazy extensions raise ``ValueError``.
 
         Returns
         -------
@@ -959,9 +975,23 @@ class AnalyzeImage(SpatialImage):
         if mmap not in (True, False, 'c', 'r'):
             raise ValueError("mmap should be one of {True, False, 'c', 'r'}")
         hdr_fh, img_fh = klass._get_fileholders(file_map)
+        lazy_filename = None
+        if lazy_extensions:
+            lazy_filename = klass._validate_lazy_extensions(hdr_fh)
         with hdr_fh.get_prepare_fileobj(mode='rb') as hdrf:
-            header = klass.header_class.from_fileobj(hdrf)
+            if lazy_extensions:
+                header = klass.header_class.from_fileobj(
+                    hdrf, lazy_extensions=True, lazy_filename=lazy_filename
+                )
+            else:
+                header = klass.header_class.from_fileobj(hdrf)
         hdr_copy = header.copy()
+        if lazy_extensions:
+            # The array proxy only needs array metadata; detach the internal
+            # header copy from the lazy extension resource so that releasing
+            # ``img.header.extensions`` closes the independently held file
+            # without a hidden reference keeping it alive
+            hdr_copy.extensions = header.exts_klass()
         imgf = img_fh.fileobj
         if imgf is None:
             imgf = img_fh.filename
@@ -981,11 +1011,40 @@ class AnalyzeImage(SpatialImage):
     def _get_fileholders(file_map):
         """Return fileholder for header and image
 
-        Allows single-file image types to return one fileholder for both types.
+        For single-file image types to return one fileholder for both types.
         For Analyze there are two fileholders, one for the header, one for the
         image.
         """
         return file_map['header'], file_map['image']
+
+    @classmethod
+    def _validate_lazy_extensions(klass, hdr_fh):
+        """Validate that lazy extension loading is possible; return filename."""
+        if not getattr(klass.header_class, 'supports_lazy_extensions', False):
+            raise ValueError(f'lazy_extensions is not supported by {klass.header_class.__name__}')
+        if not getattr(klass.header_class, 'is_single', False):
+            raise ValueError(
+                'lazy_extensions is only supported for single-file '
+                'NIfTI-1/2 images, not detached header/data pairs'
+            )
+        if hdr_fh.fileobj is not None or hdr_fh.filename is None:
+            raise ValueError(
+                'lazy_extensions requires an image loaded from a filename: '
+                'file-like objects cannot be held independently once the '
+                'opener context has closed'
+            )
+        filename = hdr_fh.filename
+        _, _, trailing = splitext_addext(filename, klass._compressed_suffixes)
+        if trailing.lower() in klass._compressed_suffixes:
+            raise ValueError(
+                f'lazy_extensions is not supported for compressed files '
+                f'({trailing}); load without lazy_extensions instead'
+            )
+        if not os.path.isfile(filename):
+            raise ValueError(
+                f'lazy_extensions requires a regular, independently openable file: {filename!r}'
+            )
+        return filename
 
     def to_file_map(self, file_map=None, dtype=None):
         """Write image to `file_map` or contained ``self.file_map``
