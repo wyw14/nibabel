@@ -15,6 +15,7 @@
 
    cifti2
    cifti2_axes
+   parcellation
 """
 
 from .cifti2 import (
@@ -41,4 +42,5 @@ from .cifti2 import (
     save,
 )
 from .cifti2_axes import Axis, BrainModelAxis, LabelAxis, ParcelsAxis, ScalarAxis, SeriesAxis
+from .parcellation import parcellate
 from .parse_cifti2 import Cifti2Extension

@@ -25,6 +25,16 @@ Eric Larson (EL), Demian Wassermann, Stephan Gerhard and Ross Markello (RM).
 
 References like "pr/298" refer to github pull request numbers.
 
+Development
+===========
+
+New features
+------------
+* Add :func:`nibabel.cifti2.parcellate` for weighted parcellation of a CIFTI-2
+  :class:`~nibabel.cifti2.BrainModelAxis` into a
+  :class:`~nibabel.cifti2.ParcelsAxis`, with sparse membership mapping, chunked
+  reads and ``'propagate'``/``'omit'`` NaN handling
+
 5.4.2 (Wednesday 11 March 2026)
 ===============================
 
