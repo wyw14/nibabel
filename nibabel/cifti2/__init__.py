@@ -15,6 +15,7 @@
 
    cifti2
    cifti2_axes
+   cifti2_align
 """
 
 from .cifti2 import (
@@ -39,6 +40,13 @@ from .cifti2 import (
     Cifti2VoxelIndicesIJK,
     load,
     save,
+)
+from .cifti2_align import (
+    MISSING_INDEX,
+    BrainModelAlignmentError,
+    BrainModelAxisProxy,
+    align_brain_model_axis,
+    compute_brain_model_mapping,
 )
 from .cifti2_axes import Axis, BrainModelAxis, LabelAxis, ParcelsAxis, ScalarAxis, SeriesAxis
 from .parse_cifti2 import Cifti2Extension
